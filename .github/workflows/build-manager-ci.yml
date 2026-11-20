@@ -2,7 +2,7 @@ name: Build Manager CI
 
 on:
   push:
-    branches: [ "dev", "youyou" ]
+    branches: [ "dev" ]
     paths:
       - '.github/workflows/build-manager.yml'
       - '.github/workflows/build-lkm.yml'
