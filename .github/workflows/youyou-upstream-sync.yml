@@ -1,0 +1,208 @@
+name: YouYou Upstream Sync
+
+# Fork-only workflow: periodically merge upstream KernelSU-Next into `youyou`.
+#
+# - A new upstream release tag (vX.Y.Z on upstream/dev) is merged first, on its
+#   own, and the merge commit is tagged `youyou-vX.Y.Z`. That tag push makes
+#   youyou-release.yml build and publish a formal Release.
+# - Then upstream/dev is merged. The branch push makes youyou-release.yml
+#   publish a pre-release build.
+# - On a merge conflict nothing is pushed for that step: an issue labelled
+#   `upstream-conflict` is opened and the run fails (GitHub emails the failure).
+#   Resolve locally, push, and the next run closes the issue.
+#
+# Requirements (see docs/YOUYOU_TROUBLESHOOTING.md):
+# - `youyou` is the repository's default branch (schedules only run there).
+# - Secret SYNC_TOKEN: PAT with Contents + Workflows read/write on this repo.
+#   GITHUB_TOKEN pushes neither trigger other workflows nor may touch
+#   .github/workflows files.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: youyou-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  BRANCH: youyou
+  UPSTREAM_URL: https://github.com/KernelSU-Next/KernelSU-Next.git
+  UPSTREAM_BRANCH: dev
+  CONFLICT_LABEL: upstream-conflict
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check token
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Secret SYNC_TOKEN is not set (PAT with Contents + Workflows read/write)."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          git fetch upstream "+refs/tags/*:refs/tags/*"
+          git fetch origin "+refs/tags/*:refs/tags/*"
+
+          UP="upstream/$UPSTREAM_BRANCH"
+          PUSH_TAGS=()
+          CHANGED=false
+
+          # Merge $1 into HEAD; on conflict record the details and return 1.
+          try_merge() {
+            local target=$1 msg=$2
+            if git merge --no-ff --no-edit -m "$msg" "$target"; then
+              CHANGED=true
+              return 0
+            fi
+            {
+              echo "target=$target"
+              echo "files<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            return 1
+          }
+
+          finish() {
+            if [ "$CHANGED" = true ]; then
+              git push origin "HEAD:$BRANCH"
+            fi
+            for t in "${PUSH_TAGS[@]}"; do
+              git push origin "refs/tags/$t"
+            done
+            echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          }
+
+          # 1) Latest formal upstream release reachable from upstream/dev.
+          LATEST=$(git tag --merged "$UP" --list 'v*' --sort=-v:refname \
+                   | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          echo "Latest upstream release: ${LATEST:-none}"
+
+          if [ -n "$LATEST" ] && ! git merge-base --is-ancestor "$LATEST" HEAD; then
+            if ! try_merge "$LATEST" "Merge upstream release $LATEST into $BRANCH"; then
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              finish
+              exit 0
+            fi
+          fi
+
+          # Tag the merge commit whose second parent is exactly the release
+          # commit (made above, or by hand with `git merge vX.Y.Z`).
+          if [ -n "$LATEST" ]; then
+            REL="youyou-$LATEST"
+            if git rev-parse -q --verify "refs/tags/$REL" >/dev/null; then
+              echo "$REL already exists"
+            else
+              TAG_COMMIT=$(git rev-parse "$LATEST^{commit}")
+              for c in $(git rev-list --first-parent --merges HEAD "^$UP"); do
+                if [ "$(git rev-parse "$c^2")" = "$TAG_COMMIT" ]; then
+                  git tag -a "$REL" -m "YouYouSU-Next $LATEST" "$c"
+                  PUSH_TAGS+=("$REL")
+                  echo "Tagged $REL at $c"
+                  break
+                fi
+              done
+            fi
+          fi
+
+          # 2) Upstream development head.
+          if ! git merge-base --is-ancestor "$UP" HEAD; then
+            UP_SHA=$(git rev-parse --short "$UP")
+            if ! try_merge "$UP" "Merge upstream $UPSTREAM_BRANCH ($UP_SHA) into $BRANCH"; then
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              finish
+              exit 0
+            fi
+          fi
+
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          finish
+
+      - name: Close resolved conflict issues
+        if: steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --label "$CONFLICT_LABEL" --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Upstream merged cleanly into \`$BRANCH\` (run ${{ github.run_id }}). Closing."
+          done
+
+      - name: Report conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.merge.outputs.target }}
+          FILES: ${{ steps.merge.outputs.files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          OPEN=$(gh issue list --label "$CONFLICT_LABEL" --state open --json number --jq 'length')
+          if [ "$OPEN" != "0" ]; then
+            echo "::warning::Merge of $TARGET still conflicts; an open '$CONFLICT_LABEL' issue already exists, not notifying again."
+            exit 0
+          fi
+
+          case "$TARGET" in
+            upstream/*) MERGE_CMD="git merge upstream/$UPSTREAM_BRANCH" ;;
+            *)          MERGE_CMD="git merge $TARGET" ;;
+          esac
+
+          gh label create "$CONFLICT_LABEL" --color B60205 \
+            --description "Automatic upstream merge needs manual resolution" --force
+
+          BODY=$(cat <<EOF
+          Automatic merge of \`$TARGET\` into \`$BRANCH\` hit conflicts. Nothing was pushed for this step.
+
+          **Conflicting files**
+          \`\`\`
+          $FILES
+          \`\`\`
+
+          **Resolve locally**
+          \`\`\`sh
+          git fetch upstream --tags
+          git switch $BRANCH && git pull
+          $MERGE_CMD
+          # fix conflicts (remember: new files under com/rifsxd/ksunext -> com/youyousu/homeyouyou)
+          git add -A && git commit
+          git push
+          \`\`\`
+          Merging the release tag itself (\`git merge vX.Y.Z\`) lets the next sync run tag it and publish a formal release.
+          The next sync run closes this issue once upstream merges cleanly.
+
+          Run: $RUN_URL
+          See docs/YOUYOU_TROUBLESHOOTING.md
+          EOF
+          )
+          gh issue create --title "Upstream merge conflict: $TARGET" \
+            --label "$CONFLICT_LABEL" --assignee "${{ github.repository_owner }}" \
+            --body "$BODY"
+
+          echo "::error::Merge of $TARGET conflicts; issue opened."
+          exit 1

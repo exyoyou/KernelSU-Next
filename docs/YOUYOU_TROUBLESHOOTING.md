@@ -20,7 +20,8 @@
 | 内核里的 KernelSU | `android_kernel_oneplus_sm8150/KernelSU-Next` 子模块，**legacy** 分支 |
 | 计算 jks 证书 | `~/android_kernel/ksu_cert_hash.sh <jks> <alias>` |
 | 检查 APK 证书 | `python3 scripts/youyou_apk_cert.py <apk>` |
-| CI 发布 | `.github/workflows/youyou-release.yml`：推送 `youyou` 后自动发 Release（tag `youyou-<versionCode>`） |
+| CI 发布 | `.github/workflows/youyou-release.yml`：推送 `youyou` 时发预发布版（tag `youyou-<versionCode>`）；推送 `youyou-vX.Y.Z` tag 时发正式版 |
+| 自动同步上游 | `.github/workflows/youyou-upstream-sync.yml`：每 6 小时自动合并上游；遇到冲突时开 Issue，并发邮件通知 |
 
 ## 管理器显示"不支持 | 未集成"
 
@@ -122,7 +123,38 @@ cd ~/android_kernel && ./build_ksu.sh
   - fork 里要有上游的 tag，版本号才是 `v3.4.2-N-gxxxx` 格式；否则只有一串哈希。
   - 推 tag 时一次推全部（`git push origin --tags`）。GitHub 一次收到超过 3 个 tag 时不会触发 workflow，所以上游的 `release.yml` 不会被误触发。
 
-## 同步上游
+## 自动同步上游（youyou-upstream-sync.yml）
+
+每 6 小时运行一次，也可以在 Actions 里手动 Run workflow。
+
+1. **上游发了新的正式版**：指 `upstream/dev` 上出现了新的 `vX.Y.Z` tag。
+   - 先**单独合并这个 tag**。
+   - 合并成功后，在合并提交上打 `youyou-vX.Y.Z` tag 并推送。
+   - `youyou-release.yml` 收到这个 tag 后，编译并发布**正式版 Release**（标记为 Latest）。
+2. **合并 `upstream/dev` 最新代码**：合并成功后推送 `youyou` 分支，会触发编译并发一个**预发布版**。
+3. **遇到冲突时**：
+   - 这一步什么都不推送。
+   - 开一个带 `upstream-conflict` 标签的 Issue，里面列出冲突的文件和解决步骤。
+   - 让这次运行失败，GitHub 会发邮件通知。
+   - 之后的运行仍然冲突时，不会重复开 Issue，也不会再发邮件。
+   - 你手动解决冲突并推送后，下一次运行会自动关闭这个 Issue。
+4. **手动解决时**：如果冲突发生在正式版 tag 上，请用 `git merge vX.Y.Z` 合并这个 tag，而不是合并 `upstream/dev`。这样下一次运行能认出这个合并，自动打 `youyou-vX.Y.Z` tag 并发布正式版。
+
+### 首次配置
+
+1. **默认分支改成 `youyou`**：Settings → General → Default branch。定时任务只会在默认分支上运行。
+2. **创建 PAT**：GitHub 头像 → Settings → Developer settings → Fine-grained tokens。
+   - 只授权本仓库。
+   - 权限：**Contents: Read and write**、**Workflows: Read and write**。
+   - 添加为仓库 Secret：`SYNC_TOKEN`。
+   - 为什么不能用 `GITHUB_TOKEN`：用它推送的提交不会触发编译；上游改了 `.github/workflows` 下的文件时，它也没有权限推送。
+3. **邮件通知**：在 GitHub 头像 → Settings → Notifications → Actions，勾选 Email，选 "Only notify for failed workflows"。
+   - 定时任务失败的邮件，会发给最后修改过 cron 设置的人。
+   - Issue 的分配人也会收到邮件。
+4. **PAT 过期**：同步会在 Check token 这一步失败。重新生成后更新 `SYNC_TOKEN` 就行。
+5. **仓库 60 天没有任何活动时**，GitHub 会自动停用定时任务。需要在 Actions 页面重新启用。
+
+## 手动同步上游
 
 ```sh
 git fetch upstream --tags
