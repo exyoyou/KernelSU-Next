@@ -20,4 +20,4 @@ cd manager
 
 cd ..
 
-adb install manager/app/build/outputs/apk/release/KernelSU_Next_v*.apk
+adb install manager/app/build/outputs/apk/release/YouYouSU-Next_v*.apk
