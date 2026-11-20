@@ -43,7 +43,7 @@ fun getGitCommitCount(): Int {
 }
 
 fun getGitDescribe(): String {
-    val process = Runtime.getRuntime().exec(arrayOf("git", "describe", "--tags", "--always"))
+    val process = Runtime.getRuntime().exec(arrayOf("git", "describe", "--tags", "--always", "--exclude", "youyou-*"))
     return process.inputStream.bufferedReader().use { it.readText().trim() }
 }
 
